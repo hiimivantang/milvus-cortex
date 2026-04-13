@@ -40,6 +40,28 @@ class TestRemember:
         fetched = runtime.get(mem.id)
         assert fetched.metadata["source"] == "settings_page"
 
+    def test_remember_with_context(self, runtime: MemoryRuntime):
+        """Multi-vector: store with context embedding."""
+        mem = runtime.remember(
+            content="User prefers TypeScript",
+            app_id="test",
+            user_id="u1",
+            context="Discussion about frontend frameworks",
+        )
+        fetched = runtime.get(mem.id)
+        assert fetched.context_embedding is not None
+        assert len(fetched.context_embedding) == 8
+
+    def test_remember_generates_sparse(self, runtime: MemoryRuntime):
+        """Hybrid search: sparse embedding is auto-generated."""
+        mem = runtime.remember(
+            content="Python is a great programming language",
+            app_id="test",
+        )
+        fetched = runtime.get(mem.id)
+        assert fetched.sparse_embedding is not None
+        assert len(fetched.sparse_embedding) > 0
+
 
 class TestSearch:
     def test_search_returns_results(self, runtime: MemoryRuntime):
@@ -53,9 +75,19 @@ class TestSearch:
             user_id="u1",
         )
         assert len(results) >= 1
-        # All results should be scoped to u1
         for r in results:
             assert r.memory.user_id == "u1"
+
+    def test_search_dense_mode(self, runtime: MemoryRuntime):
+        runtime.remember(content="fact", app_id="t")
+        results = runtime.search(query="anything", app_id="t", mode="dense")
+        assert len(results) >= 1
+
+    def test_search_hybrid_mode(self, runtime: MemoryRuntime):
+        runtime.remember(content="Python is great for data science", app_id="t")
+        runtime.remember(content="JavaScript rules the frontend", app_id="t")
+        results = runtime.search(query="Python data", app_id="t", mode="hybrid")
+        assert len(results) >= 1
 
     def test_search_with_type_filter(self, runtime: MemoryRuntime):
         runtime.remember(content="fact", app_id="t", memory_type="semantic")

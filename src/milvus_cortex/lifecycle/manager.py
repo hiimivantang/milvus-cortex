@@ -1,8 +1,9 @@
-"""Memory lifecycle management — dedup, merge, expiry, forget."""
+"""Memory lifecycle management — dedup, merge, expiry, forget, consolidation."""
 
 from __future__ import annotations
 
 import time
+from collections import defaultdict
 
 from milvus_cortex.config import LifecycleConfig
 from milvus_cortex.embedding.base import EmbeddingProvider
@@ -11,7 +12,7 @@ from milvus_cortex.storage.milvus import MilvusStorage
 
 
 class LifecycleManager:
-    """Handles memory lifecycle: deduplication, expiry, and forgetting."""
+    """Handles memory lifecycle: deduplication, expiry, forgetting, and consolidation."""
 
     def __init__(
         self,
@@ -62,7 +63,6 @@ class LifecycleManager:
             return 0
 
         now = time.time()
-        # Fetch candidates that might be expired
         all_memories = self._storage.list_memories(filters=filters, limit=10000)
         expired_ids = [
             m.id for m in all_memories
@@ -79,11 +79,7 @@ class LifecycleManager:
         return self._storage.delete(memory_ids)
 
     def merge_memories(self, memory_ids: list[str], merged_content: str) -> Memory | None:
-        """Merge multiple memories into one. Deletes originals, returns the new memory.
-
-        The caller provides the merged content (e.g. from an LLM summarization).
-        The new memory inherits the highest importance and earliest created_at.
-        """
+        """Merge multiple memories into one. Deletes originals, returns the new memory."""
         originals: list[Memory] = []
         for mid in memory_ids:
             m = self._storage.get(mid)
@@ -93,7 +89,6 @@ class LifecycleManager:
         if len(originals) < 2:
             return None
 
-        # Build merged memory
         embedding = self._embedder.embed_one(merged_content)
         merged = Memory(
             content=merged_content,
@@ -113,3 +108,83 @@ class LifecycleManager:
         self._storage.delete([m.id for m in originals])
         self._storage.insert([merged])
         return merged
+
+    # ------------------------------------------------------------------
+    # Consolidation pipeline
+    # ------------------------------------------------------------------
+
+    def consolidate(
+        self,
+        filters: dict | None = None,
+        similarity_threshold: float | None = None,
+        min_cluster_size: int | None = None,
+    ) -> list[Memory]:
+        """Cluster related memories and merge them into consolidated versions.
+
+        1. Fetch all memories in scope
+        2. For each memory, find near-duplicates (cluster by vector similarity)
+        3. Merge clusters that meet the minimum size
+        4. Return the new consolidated memories
+
+        Does NOT use LLM — merges by concatenation with dedup.
+        For LLM-summarized consolidation, use merge_memories() directly.
+        """
+        threshold = similarity_threshold or self._config.consolidation_threshold
+        min_size = min_cluster_size or self._config.consolidation_min_cluster
+
+        all_memories = self._storage.list_memories(filters=filters, limit=10000)
+        if len(all_memories) < min_size:
+            return []
+
+        # Build clusters via greedy nearest-neighbor
+        clustered: set[str] = set()
+        clusters: list[list[Memory]] = []
+
+        for memory in all_memories:
+            if memory.id in clustered or not memory.embedding:
+                continue
+
+            # Find similar memories
+            candidates = self._storage.search(
+                embedding=memory.embedding,
+                filters=filters,
+                top_k=20,
+            )
+
+            cluster = [memory]
+            clustered.add(memory.id)
+
+            for result in candidates:
+                if result.memory.id in clustered:
+                    continue
+                if result.score >= threshold:
+                    cluster.append(result.memory)
+                    clustered.add(result.memory.id)
+
+            if len(cluster) >= min_size:
+                clusters.append(cluster)
+
+        # Merge each cluster
+        consolidated: list[Memory] = []
+        for cluster in clusters:
+            # Sort by importance (highest first), then by recency
+            cluster.sort(key=lambda m: (-m.importance, -m.created_at))
+
+            # Build consolidated content: keep unique content
+            seen_content: set[str] = set()
+            parts: list[str] = []
+            for m in cluster:
+                normalized = m.content.strip().lower()
+                if normalized not in seen_content:
+                    seen_content.add(normalized)
+                    parts.append(m.content)
+
+            merged_content = " | ".join(parts)
+            merged = self.merge_memories(
+                memory_ids=[m.id for m in cluster],
+                merged_content=merged_content,
+            )
+            if merged:
+                consolidated.append(merged)
+
+        return consolidated

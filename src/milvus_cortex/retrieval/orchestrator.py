@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import time
 
+from milvus_cortex.config import HybridSearchConfig, MultiVectorConfig
 from milvus_cortex.embedding.base import EmbeddingProvider
+from milvus_cortex.embedding.sparse import query_to_sparse
 from milvus_cortex.models import ContextBundle, MemoryType, SearchResult
 from milvus_cortex.storage.milvus import MilvusStorage
 
@@ -12,9 +14,17 @@ from milvus_cortex.storage.milvus import MilvusStorage
 class RetrievalOrchestrator:
     """Coordinates search across storage with embedding + filtering + ranking."""
 
-    def __init__(self, storage: MilvusStorage, embedder: EmbeddingProvider) -> None:
+    def __init__(
+        self,
+        storage: MilvusStorage,
+        embedder: EmbeddingProvider,
+        hybrid_cfg: HybridSearchConfig,
+        multi_vec_cfg: MultiVectorConfig,
+    ) -> None:
         self._storage = storage
         self._embedder = embedder
+        self._hybrid_cfg = hybrid_cfg
+        self._multi_vec_cfg = multi_vec_cfg
 
     def search(
         self,
@@ -23,19 +33,49 @@ class RetrievalOrchestrator:
         top_k: int = 10,
         memory_types: list[MemoryType] | None = None,
         min_score: float = 0.0,
+        mode: str = "auto",  # "dense", "sparse", "hybrid", "multi_vector", "auto"
+        context_query: str | None = None,
     ) -> list[SearchResult]:
-        """Vector search with optional type/scope filtering."""
+        """Vector search with optional hybrid/multi-vector modes."""
         query_embedding = self._embedder.embed_one(query)
 
         combined_filters = dict(filters) if filters else {}
         if memory_types and len(memory_types) == 1:
             combined_filters["memory_type"] = memory_types[0].value
 
-        results = self._storage.search(
-            embedding=query_embedding,
-            filters=combined_filters,
-            top_k=top_k,
-        )
+        # Choose search mode
+        if mode == "auto":
+            mode = "hybrid" if self._hybrid_cfg.enabled else "dense"
+
+        if mode == "hybrid" and self._hybrid_cfg.enabled:
+            sparse = query_to_sparse(query)
+            if sparse:
+                results = self._storage.hybrid_search(
+                    dense_embedding=query_embedding,
+                    sparse_embedding=sparse,
+                    filters=combined_filters,
+                    top_k=top_k,
+                )
+            else:
+                results = self._storage.search(
+                    embedding=query_embedding,
+                    filters=combined_filters,
+                    top_k=top_k,
+                )
+        elif mode == "multi_vector" and self._multi_vec_cfg.enabled and context_query:
+            context_embedding = self._embedder.embed_one(context_query)
+            results = self._storage.multi_vector_search(
+                content_embedding=query_embedding,
+                context_embedding=context_embedding,
+                filters=combined_filters,
+                top_k=top_k,
+            )
+        else:
+            results = self._storage.search(
+                embedding=query_embedding,
+                filters=combined_filters,
+                top_k=top_k,
+            )
 
         # Post-filter by memory type if multiple types
         if memory_types and len(memory_types) > 1:
@@ -62,6 +102,8 @@ class RetrievalOrchestrator:
         top_k: int = 10,
         memory_types: list[MemoryType] | None = None,
         min_score: float = 0.0,
+        mode: str = "auto",
+        context_query: str | None = None,
     ) -> ContextBundle:
         """Search and assemble a ContextBundle ready for prompt injection."""
         results = self.search(
@@ -70,9 +112,10 @@ class RetrievalOrchestrator:
             top_k=top_k,
             memory_types=memory_types,
             min_score=min_score,
+            mode=mode,
+            context_query=context_query,
         )
 
-        # Rough token estimate: ~4 chars per token
         total_chars = sum(len(r.memory.content) for r in results)
         token_estimate = total_chars // 4
 
