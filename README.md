@@ -15,6 +15,19 @@ Generic memory frameworks (like mem0) support 25+ vector stores but treat each o
 | Observability | None | **Native collection stats + search diagnostics** |
 | Multi-tenancy | Filter-based | **Partition key support (standalone/cloud)** |
 
+## Retrieval Quality (LongMemEval-S Benchmark)
+
+Benchmarked on [LongMemEval](https://github.com/xiaowu0162/longmemeval) (ICLR 2025), 465 questions, Milvus standalone 2.5+, `text-embedding-3-small`:
+
+| Mode | Recall@5 | Recall@10 | NDCG@5 | NDCG@10 |
+|------|----------|-----------|--------|---------|
+| Dense only | 0.974 | 0.985 | 0.916 | 0.926 |
+| **Hybrid (BM25 + Dense)** | **0.974** | **0.996** | **0.915** | **0.935** |
+
+Hybrid search improves Recall@10 by +1.1% and NDCG@10 by +1.0% over dense-only. On Milvus standalone, hybrid uses server-side BM25 via `Function(FunctionType.BM25)` for maximum quality. On Milvus Lite, it falls back to a client-side BM25 tokenizer.
+
+Reproduce: `docker-compose up -d && python benchmarks/longmemeval/run_benchmark.py --data path/to/longmemeval_s_cleaned.json`
+
 ## Quickstart
 
 ```bash
