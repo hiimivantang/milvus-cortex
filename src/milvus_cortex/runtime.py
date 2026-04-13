@@ -1,4 +1,8 @@
-"""Main MemoryRuntime — the public API surface."""
+"""Main MemoryRuntime — the public API surface.
+
+The runtime NEVER imports sparse embedding functions or branches on BM25 mode.
+All sparse/BM25 concerns are encapsulated in the storage layer.
+"""
 
 from __future__ import annotations
 
@@ -9,7 +13,6 @@ from milvus_cortex.config import CortexConfig
 from milvus_cortex.embedding.base import EmbeddingProvider
 from milvus_cortex.embedding.fake import FakeEmbedding
 from milvus_cortex.embedding.openai import OpenAIEmbedding
-from milvus_cortex.embedding.sparse import text_to_sparse
 from milvus_cortex.extraction.base import MemoryExtractor
 from milvus_cortex.extraction.llm import LLMExtractor
 from milvus_cortex.graph.engine import GraphEngine
@@ -27,6 +30,7 @@ from milvus_cortex.models import (
 )
 from milvus_cortex.observability import ObservabilityManager
 from milvus_cortex.retrieval.orchestrator import RetrievalOrchestrator
+from milvus_cortex.retrieval.reranker import CrossEncoderReranker, Reranker
 from milvus_cortex.storage.milvus import MilvusStorage
 
 
@@ -42,12 +46,20 @@ def _build_extractor(config: CortexConfig) -> MemoryExtractor | None:
     return LLMExtractor(config.extraction)
 
 
+def _build_reranker(config: CortexConfig) -> Reranker | None:
+    if config.reranker.provider == "none":
+        return None
+    if config.reranker.provider == "cross_encoder":
+        return CrossEncoderReranker(model_name=config.reranker.model)
+    return None
+
+
 class MemoryRuntime:
     """Developer-facing API for the Milvus memory runtime.
 
     Supports hybrid search (dense+sparse), multi-vector representations,
     graph-on-Milvus (entity/relationship memory), memory consolidation,
-    and Milvus-native observability.
+    reranking, and Milvus-native observability.
     """
 
     def __init__(
@@ -78,7 +90,10 @@ class MemoryRuntime:
         storage.initialize()
         embedder = _build_embedder(config)
         extractor = _build_extractor(config)
-        retrieval = RetrievalOrchestrator(storage, embedder, config.hybrid_search, config.multi_vector)
+        reranker = _build_reranker(config)
+        retrieval = RetrievalOrchestrator(
+            storage, embedder, config.hybrid_search, config.multi_vector, reranker,
+        )
         lifecycle = LifecycleManager(storage, embedder, config.lifecycle)
 
         graph = None
@@ -125,9 +140,13 @@ class MemoryRuntime:
         importance: float = 0.5,
         metadata: dict[str, Any] | None = None,
         expires_at: float | None = None,
-        context: str | None = None,  # Multi-vector: surrounding context text
+        context: str | None = None,
     ) -> Memory:
-        """Store a single memory with automatic embedding, dedup, and TTL."""
+        """Store a single memory with automatic embedding, dedup, and TTL.
+
+        Sparse embeddings for hybrid search are handled by the storage layer —
+        never computed here.
+        """
         if isinstance(memory_type, str):
             memory_type = MemoryType(memory_type)
 
@@ -137,11 +156,6 @@ class MemoryRuntime:
         context_embedding = None
         if self._config.multi_vector.enabled and context:
             context_embedding = self._embedder.embed_one(context)
-
-        # Hybrid search: sparse embedding
-        sparse_embedding = None
-        if self._config.hybrid_search.enabled:
-            sparse_embedding = text_to_sparse(content)
 
         memory = Memory(
             content=content,
@@ -153,7 +167,7 @@ class MemoryRuntime:
             workspace_id=workspace_id,
             embedding=embedding,
             context_embedding=context_embedding,
-            sparse_embedding=sparse_embedding,
+            # sparse_embedding is NOT set here — storage layer handles it
             importance=importance,
             metadata=metadata or {},
             source="manual",
@@ -172,7 +186,6 @@ class MemoryRuntime:
                 existing.content = content
                 existing.embedding = embedding
                 existing.context_embedding = context_embedding
-                existing.sparse_embedding = sparse_embedding
                 existing.importance = importance
                 existing.metadata.update(metadata or {})
                 self._storage.update(existing)
@@ -229,8 +242,7 @@ class MemoryRuntime:
                 mem.agent_id = agent_id
                 mem.workspace_id = workspace_id
                 mem.embedding = self._embedder.embed_one(mem.content)
-                if self._config.hybrid_search.enabled:
-                    mem.sparse_embedding = text_to_sparse(mem.content)
+                # sparse_embedding NOT set here — storage layer handles it
                 mem = self._lifecycle.apply_ttl(mem)
                 scope_filters = self._scope_filters(
                     app_id=app_id, user_id=user_id, session_id=session_id,
@@ -244,7 +256,7 @@ class MemoryRuntime:
         return stored
 
     # ------------------------------------------------------------------
-    # Core API: search (with hybrid/multi-vector modes)
+    # Core API: search (with hybrid/multi-vector/rerank modes)
     # ------------------------------------------------------------------
 
     def search(
@@ -259,10 +271,11 @@ class MemoryRuntime:
         memory_types: list[str | MemoryType] | None = None,
         top_k: int = 10,
         min_score: float = 0.0,
-        mode: str = "auto",  # "dense", "hybrid", "multi_vector", "auto"
-        context_query: str | None = None,  # For multi_vector mode
+        mode: str = "auto",
+        context_query: str | None = None,
+        rerank: bool = False,
     ) -> list[SearchResult]:
-        """Search for relevant memories with optional hybrid or multi-vector mode."""
+        """Search for relevant memories with optional hybrid, multi-vector, or rerank mode."""
         filters = self._scope_filters(
             app_id=app_id, user_id=user_id, session_id=session_id,
             agent_id=agent_id, workspace_id=workspace_id,
@@ -276,6 +289,7 @@ class MemoryRuntime:
             query=query, filters=filters, top_k=top_k,
             memory_types=types, min_score=min_score,
             mode=mode, context_query=context_query,
+            rerank=rerank,
         )
         latency_ms = (time.time() - t0) * 1000
         self._observability.record_search_latency(latency_ms)
@@ -298,6 +312,7 @@ class MemoryRuntime:
         top_k: int = 10,
         min_score: float = 0.0,
         mode: str = "auto",
+        rerank: bool = False,
     ) -> ContextBundle:
         """Retrieve and assemble context for prompt injection."""
         filters = self._scope_filters(
@@ -306,7 +321,7 @@ class MemoryRuntime:
         )
         return self._retrieval.get_context(
             query=query, filters=filters, top_k=top_k,
-            min_score=min_score, mode=mode,
+            min_score=min_score, mode=mode, rerank=rerank,
         )
 
     # ------------------------------------------------------------------
@@ -391,7 +406,6 @@ class MemoryRuntime:
         user_id: str | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> Entity:
-        """Add an entity to the knowledge graph (with automatic resolution)."""
         if not self._graph:
             raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
         return self._graph.add_entity(
@@ -409,7 +423,6 @@ class MemoryRuntime:
         app_id: str | None = None,
         user_id: str | None = None,
     ) -> Relationship:
-        """Add a relationship between two entities."""
         if not self._graph:
             raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
         return self._graph.add_relationship(
@@ -419,7 +432,6 @@ class MemoryRuntime:
         )
 
     def get_relationships(self, entity_id: str, direction: str = "both") -> list[Relationship]:
-        """Get relationships for an entity."""
         if not self._graph:
             raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
         return self._graph.get_relationships(entity_id, direction=direction)
@@ -433,7 +445,6 @@ class MemoryRuntime:
         top_k: int = 5,
         depth: int = 1,
     ) -> dict[str, Any]:
-        """Search the knowledge graph for entities and their neighborhoods."""
         if not self._graph:
             raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
         return self._graph.graph_search(
@@ -451,15 +462,12 @@ class MemoryRuntime:
         app_id: str | None = None,
         user_id: str | None = None,
     ) -> MemoryStats:
-        """Get memory statistics."""
         return self._observability.get_stats(app_id=app_id, user_id=user_id)
 
     def health(self) -> CollectionHealth:
-        """Get Milvus collection health status."""
         return self._observability.get_health()
 
     def search_diagnostics(self) -> dict:
-        """Get search performance diagnostics."""
         return self._observability.get_search_diagnostics()
 
     # ------------------------------------------------------------------

@@ -29,6 +29,7 @@ class HybridSearchConfig(BaseModel):
     """Settings for hybrid dense+sparse search."""
 
     enabled: bool = True
+    use_server_bm25: bool | None = None  # None = auto-detect (standalone=True, Lite=False)
     sparse_weight: float = 0.3  # Weight for sparse results in RRF fusion
     dense_weight: float = 0.7  # Weight for dense results in RRF fusion
     rrf_k: int = 60  # RRF constant (standard default)
@@ -71,6 +72,13 @@ class LifecycleConfig(BaseModel):
     consolidation_min_cluster: int = 3  # Min memories to trigger consolidation
 
 
+class RerankerConfig(BaseModel):
+    """Settings for search result reranking."""
+
+    provider: str = "none"  # "none" | "cross_encoder"
+    model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+
 class CortexConfig(BaseModel):
     """Top-level configuration for the memory runtime."""
 
@@ -81,6 +89,7 @@ class CortexConfig(BaseModel):
     extraction: ExtractionConfig = Field(default_factory=ExtractionConfig)
     graph: GraphConfig = Field(default_factory=GraphConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
+    reranker: RerankerConfig = Field(default_factory=RerankerConfig)
 
     @classmethod
     def for_testing(cls) -> CortexConfig:

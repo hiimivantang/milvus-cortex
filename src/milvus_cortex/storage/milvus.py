@@ -1,14 +1,20 @@
-"""Milvus storage adapter with hybrid search, multi-vector, and partition key support."""
+"""Milvus storage adapter with hybrid search, multi-vector, and partition key support.
+
+BM25 mode branching is fully encapsulated here. The orchestrator and runtime
+never import sparse embedding functions or branch on BM25 mode.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 from pymilvus import AnnSearchRequest, DataType, MilvusClient, RRFRanker
 
-from milvus_cortex.config import CortexConfig, HybridSearchConfig, MilvusConfig, EmbeddingConfig, MultiVectorConfig
+from milvus_cortex.config import CortexConfig
+from milvus_cortex.embedding.sparse import query_to_sparse, text_to_sparse
 from milvus_cortex.models import (
     Entity,
     Memory,
@@ -17,11 +23,19 @@ from milvus_cortex.models import (
     SearchResult,
 )
 
+logger = logging.getLogger(__name__)
+
 SCOPE_FIELDS = ("app_id", "user_id", "session_id", "agent_id", "workspace_id")
 
 
 class MilvusStorage:
-    """Milvus-backed storage with hybrid search, multi-vector, and partition key support."""
+    """Milvus-backed storage with hybrid search, multi-vector, and partition key support.
+
+    All BM25 mode branching is encapsulated here. When connected to Milvus
+    standalone/cloud (2.5+), uses server-side BM25 via Function(FunctionType.BM25).
+    When connected to Milvus Lite (.db file), falls back to client-side sparse
+    vectors from embedding/sparse.py.
+    """
 
     def __init__(self, config: CortexConfig) -> None:
         self._milvus_cfg = config.milvus
@@ -34,6 +48,19 @@ class MilvusStorage:
         self._entity_collection = f"{config.milvus.collection_prefix}_entities"
         self._rel_collection = f"{config.milvus.collection_prefix}_relationships"
         self._client: MilvusClient | None = None
+
+        # BM25 mode: auto-detect from URI unless explicitly set
+        if config.hybrid_search.use_server_bm25 is not None:
+            self._use_server_bm25 = config.hybrid_search.use_server_bm25
+        else:
+            # Auto-detect: standalone/cloud = server BM25, Lite (.db) = client fallback
+            is_lite = config.milvus.uri.endswith(".db")
+            self._use_server_bm25 = config.hybrid_search.enabled and not is_lite
+
+    @property
+    def use_server_bm25(self) -> bool:
+        """Whether server-side BM25 is active (vs client-side sparse fallback)."""
+        return self._use_server_bm25
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -49,7 +76,6 @@ class MilvusStorage:
         self._ensure_memory_collection()
 
     def initialize_graph_collections(self) -> None:
-        """Create entity and relationship collections for graph-on-Milvus."""
         self._ensure_entity_collection()
         self._ensure_relationship_collection()
 
@@ -114,11 +140,16 @@ class MilvusStorage:
     def hybrid_search(
         self,
         dense_embedding: list[float],
-        sparse_embedding: dict[int, float],
+        query_text: str,
         filters: dict | None = None,
         top_k: int = 10,
     ) -> list[SearchResult]:
-        """Hybrid dense+sparse search using RRF fusion."""
+        """Hybrid dense+sparse search using RRF fusion.
+
+        Storage decides internally whether to use server-side BM25
+        (pass raw text to Milvus) or client-side sparse (compute
+        sparse vector from query_text).
+        """
         filter_expr = self._build_filter_expr(filters) if filters else ""
 
         dense_req = AnnSearchRequest(
@@ -128,13 +159,29 @@ class MilvusStorage:
             limit=top_k,
             expr=filter_expr or None,
         )
-        sparse_req = AnnSearchRequest(
-            data=[sparse_embedding],
-            anns_field="sparse_embedding",
-            param={"metric_type": "IP"},
-            limit=top_k,
-            expr=filter_expr or None,
-        )
+
+        if self._use_server_bm25:
+            # Server-side BM25: pass raw text, Milvus handles tokenization + scoring
+            sparse_req = AnnSearchRequest(
+                data=[query_text],
+                anns_field="sparse_embedding",
+                param={"metric_type": "BM25"},
+                limit=top_k,
+                expr=filter_expr or None,
+            )
+        else:
+            # Client-side fallback: compute sparse vector from text
+            sparse = query_to_sparse(query_text)
+            if not sparse:
+                # No meaningful tokens — fall back to dense-only
+                return self.search(dense_embedding, filters, top_k)
+            sparse_req = AnnSearchRequest(
+                data=[sparse],
+                anns_field="sparse_embedding",
+                param={"metric_type": "IP"},
+                limit=top_k,
+                expr=filter_expr or None,
+            )
 
         results = self._client.hybrid_search(
             collection_name=self._collection_name,
@@ -305,7 +352,7 @@ class MilvusStorage:
             "id": rel.id,
             "source_id": rel.source_id,
             "target_id": rel.target_id,
-            "_vec": [0.0, 0.0, 0.0, 0.0],  # Dummy vector required by Milvus
+            "_vec": [0.0, 0.0, 0.0, 0.0],
             "relation_type": rel.relation_type,
             "description": rel.description,
             "weight": rel.weight,
@@ -320,7 +367,7 @@ class MilvusStorage:
     def get_relationships(
         self,
         entity_id: str,
-        direction: str = "both",  # "outgoing", "incoming", "both"
+        direction: str = "both",
     ) -> list[Relationship]:
         results: list[Relationship] = []
         if direction in ("outgoing", "both"):
@@ -339,7 +386,6 @@ class MilvusStorage:
                 limit=100,
             )
             results.extend(self._rows_to_relationships(rows))
-        # Deduplicate
         seen = set()
         unique = []
         for r in results:
@@ -387,6 +433,28 @@ class MilvusStorage:
 
     def _ensure_memory_collection(self) -> None:
         if self._client.has_collection(self._collection_name):
+            # Schema migration detection for server BM25
+            if self._use_server_bm25:
+                try:
+                    info = self._client.describe_collection(self._collection_name)
+                    has_bm25 = False
+                    if hasattr(info, "get"):
+                        functions = info.get("functions", [])
+                        has_bm25 = any(
+                            f.get("type", "") == "BM25" or "bm25" in str(f.get("name", "")).lower()
+                            for f in functions
+                        ) if functions else False
+                    if not has_bm25:
+                        logger.warning(
+                            "Collection '%s' exists without BM25 Function. "
+                            "Falling back to client-side sparse. "
+                            "To use server BM25, drop and recreate the collection.",
+                            self._collection_name,
+                        )
+                        self._use_server_bm25 = False
+                except Exception:
+                    # Can't detect schema — fall back safely
+                    self._use_server_bm25 = False
             return
 
         schema = self._client.create_schema(auto_id=False, enable_dynamic_field=True)
@@ -403,8 +471,43 @@ class MilvusStorage:
 
         # Hybrid search: sparse vector
         if self._hybrid_cfg.enabled:
-            schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
-            index_params.add_index(field_name="sparse_embedding", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
+            if self._use_server_bm25:
+                # Server-side BM25: content as explicit VARCHAR with analyzer, BM25 Function
+                schema.add_field(
+                    "content", DataType.VARCHAR, max_length=65535,
+                    enable_analyzer=True,
+                )
+                schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
+                try:
+                    from pymilvus import Function, FunctionType
+                    bm25_fn = Function(
+                        name="content_bm25",
+                        function_type=FunctionType.BM25,
+                        input_field_names=["content"],
+                        output_field_names=["sparse_embedding"],
+                    )
+                    schema.add_function(bm25_fn)
+                    index_params.add_index(
+                        field_name="sparse_embedding",
+                        index_type="SPARSE_INVERTED_INDEX",
+                        metric_type="BM25",
+                    )
+                except (ImportError, Exception) as e:
+                    logger.warning("Server BM25 unavailable (%s), falling back to client-side sparse", e)
+                    self._use_server_bm25 = False
+                    index_params.add_index(
+                        field_name="sparse_embedding",
+                        index_type="SPARSE_INVERTED_INDEX",
+                        metric_type="IP",
+                    )
+            else:
+                # Client-side sparse fallback
+                schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
+                index_params.add_index(
+                    field_name="sparse_embedding",
+                    index_type="SPARSE_INVERTED_INDEX",
+                    metric_type="IP",
+                )
 
         self._client.create_collection(
             collection_name=self._collection_name,
@@ -415,39 +518,27 @@ class MilvusStorage:
     def _ensure_entity_collection(self) -> None:
         if self._client.has_collection(self._entity_collection):
             return
-
         schema = self._client.create_schema(auto_id=False, enable_dynamic_field=True)
         schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=64)
         schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._dim)
-
         index_params = self._client.prepare_index_params()
         index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
-
         self._client.create_collection(
-            collection_name=self._entity_collection,
-            schema=schema,
-            index_params=index_params,
+            collection_name=self._entity_collection, schema=schema, index_params=index_params,
         )
 
     def _ensure_relationship_collection(self) -> None:
         if self._client.has_collection(self._rel_collection):
             return
-
         schema = self._client.create_schema(auto_id=False, enable_dynamic_field=True)
         schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=64)
-        # source_id and target_id as explicit fields for filtered queries
         schema.add_field("source_id", DataType.VARCHAR, max_length=64)
         schema.add_field("target_id", DataType.VARCHAR, max_length=64)
-        # Dummy vector field required by Milvus — minimal dim
         schema.add_field("_vec", DataType.FLOAT_VECTOR, dim=4)
-
         index_params = self._client.prepare_index_params()
         index_params.add_index(field_name="_vec", index_type="AUTOINDEX", metric_type="COSINE")
-
         self._client.create_collection(
-            collection_name=self._rel_collection,
-            schema=schema,
-            index_params=index_params,
+            collection_name=self._rel_collection, schema=schema, index_params=index_params,
         )
 
     # ------------------------------------------------------------------
@@ -455,10 +546,22 @@ class MilvusStorage:
     # ------------------------------------------------------------------
 
     def _memory_to_row(self, memory: Memory) -> dict[str, Any]:
+        content = memory.content
+
+        # Truncation guard for server BM25 (VARCHAR max_length=65535 bytes)
+        if self._use_server_bm25:
+            content_bytes = content.encode("utf-8")
+            if len(content_bytes) > 65535:
+                logger.warning(
+                    "Content exceeds 65535 bytes (%d), truncating for BM25 VARCHAR field",
+                    len(content_bytes),
+                )
+                content = content_bytes[:65535].decode("utf-8", errors="ignore")
+
         row: dict[str, Any] = {
             "id": memory.id,
             "embedding": memory.embedding or [0.0] * self._dim,
-            "content": memory.content,
+            "content": content,
             "memory_type": memory.memory_type.value,
             **{scope: getattr(memory, scope) or "" for scope in SCOPE_FIELDS},
             "metadata_json": json.dumps(memory.metadata),
@@ -471,7 +574,12 @@ class MilvusStorage:
         if self._multi_vec.enabled:
             row["context_embedding"] = memory.context_embedding or [0.0] * self._ctx_dim
         if self._hybrid_cfg.enabled:
-            row["sparse_embedding"] = memory.sparse_embedding or {}
+            if self._use_server_bm25:
+                # Server BM25: Milvus auto-generates sparse from content — do NOT include sparse_embedding
+                pass
+            else:
+                # Client-side fallback: compute sparse vector from content
+                row["sparse_embedding"] = memory.sparse_embedding or text_to_sparse(content)
         return row
 
     def _row_to_memory(self, row: dict[str, Any]) -> Memory:
