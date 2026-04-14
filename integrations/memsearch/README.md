@@ -29,11 +29,18 @@ Wait for Milvus to be healthy (~30 seconds):
 curl http://localhost:9091/healthz
 ```
 
-### 2. Install the package
+### 2. Install the packages
 
 From the repo root:
 
 ```bash
+# Install milvus-cortex (editable)
+pip install -e .
+
+# Uninstall upstream memsearch if installed (avoids package name collision)
+pip uninstall memsearch -y 2>/dev/null
+
+# Install the cortex-powered fork
 pip install -e integrations/memsearch
 ```
 

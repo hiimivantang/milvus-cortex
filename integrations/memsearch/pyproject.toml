@@ -10,9 +10,11 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "milvus-cortex @ file:///${PROJECT_ROOT}/../../",
     "click>=8.0",
     "openai>=1.0",
+    "pymilvus>=2.5.0",
+    "milvus-lite>=2.4.0",
+    "pydantic>=2.0",
     "setuptools",
     "tomli-w",
     "watchdog>=3.0",
