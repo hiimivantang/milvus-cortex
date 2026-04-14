@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import math
 import time
-from collections import defaultdict
 
 from milvus_cortex.config import LifecycleConfig
 from milvus_cortex.embedding.base import EmbeddingProvider
@@ -42,6 +42,9 @@ class LifecycleManager:
         """Check if a near-duplicate already exists.
 
         Returns the existing memory if a duplicate is found, None otherwise.
+        Uses both exact content matching and vector similarity with a
+        token-overlap guard to prevent false deduplication of semantically
+        similar but distinct memories.
         """
         if not self._config.auto_dedup or not memory.embedding:
             return None
@@ -52,25 +55,32 @@ class LifecycleManager:
             top_k=3,
         )
 
+        normalized_new = memory.content.strip().lower()
+        new_tokens = set(normalized_new.split())
+
         for result in candidates:
-            if result.score >= self._config.dedup_threshold:
+            if result.score < self._config.dedup_threshold:
+                continue
+            existing_normalized = result.memory.content.strip().lower()
+            # Exact content match — always a duplicate
+            if existing_normalized == normalized_new:
                 return result.memory
+            # Token-overlap guard: require sufficient Jaccard similarity
+            # to prevent false dedup of semantically similar but distinct content
+            # (e.g. "User prefers Python" vs "User uses Python at work")
+            existing_tokens = set(existing_normalized.split())
+            union = new_tokens | existing_tokens
+            if union:
+                overlap = len(new_tokens & existing_tokens) / len(union)
+                if overlap >= self._config.dedup_content_threshold:
+                    return result.memory
         return None
 
     def expire_memories(self, filters: dict | None = None) -> int:
-        """Delete all expired memories. Returns count of deleted memories."""
+        """Delete all expired memories using server-side scalar filtering."""
         if not self._config.auto_expire:
             return 0
-
-        now = time.time()
-        all_memories = self._storage.list_memories(filters=filters, limit=10000)
-        expired_ids = [
-            m.id for m in all_memories
-            if m.expires_at is not None and m.expires_at <= now
-        ]
-        if expired_ids:
-            return self._storage.delete(expired_ids)
-        return 0
+        return self._storage.delete_expired(time.time(), filters)
 
     def forget(self, memory_ids: list[str]) -> int:
         """Explicitly delete specific memories."""
@@ -113,6 +123,16 @@ class LifecycleManager:
     # Consolidation pipeline
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _cosine_similarity(a: list[float], b: list[float]) -> float:
+        """Compute cosine similarity between two vectors in-memory."""
+        dot = sum(x * y for x, y in zip(a, b))
+        norm_a = math.sqrt(sum(x * x for x in a))
+        norm_b = math.sqrt(sum(x * x for x in b))
+        if norm_a == 0 or norm_b == 0:
+            return 0.0
+        return dot / (norm_a * norm_b)
+
     def consolidate(
         self,
         filters: dict | None = None,
@@ -122,44 +142,47 @@ class LifecycleManager:
         """Cluster related memories and merge them into consolidated versions.
 
         1. Fetch all memories in scope
-        2. For each memory, find near-duplicates (cluster by vector similarity)
+        2. Cluster by in-memory pairwise cosine similarity (no O(n) search calls)
         3. Merge clusters that meet the minimum size
         4. Return the new consolidated memories
 
-        Does NOT use LLM — merges by concatenation with dedup.
+        Does NOT use LLM — merges by structured dedup.
         For LLM-summarized consolidation, use merge_memories() directly.
         """
         threshold = similarity_threshold or self._config.consolidation_threshold
         min_size = min_cluster_size or self._config.consolidation_min_cluster
 
-        all_memories = self._storage.list_memories(filters=filters, limit=10000)
+        # Cap at 2000 to keep in-memory pairwise similarity tractable
+        all_memories = self._storage.list_memories(filters=filters, limit=2000)
         if len(all_memories) < min_size:
             return []
 
-        # Build clusters via greedy nearest-neighbor
+        # Filter to memories with embeddings
+        memories = [m for m in all_memories if m.embedding]
+        if len(memories) < min_size:
+            return []
+
+        # Build clusters via in-memory pairwise cosine similarity.
+        # Avoids O(n) Milvus network round-trips. Capped at 2000 memories
+        # to keep O(n²) in-memory computation fast on high-dim vectors.
         clustered: set[str] = set()
         clusters: list[list[Memory]] = []
 
-        for memory in all_memories:
-            if memory.id in clustered or not memory.embedding:
+        for i, memory in enumerate(memories):
+            if memory.id in clustered:
                 continue
-
-            # Find similar memories
-            candidates = self._storage.search(
-                embedding=memory.embedding,
-                filters=filters,
-                top_k=20,
-            )
 
             cluster = [memory]
             clustered.add(memory.id)
 
-            for result in candidates:
-                if result.memory.id in clustered:
+            for j in range(i + 1, len(memories)):
+                candidate = memories[j]
+                if candidate.id in clustered:
                     continue
-                if result.score >= threshold:
-                    cluster.append(result.memory)
-                    clustered.add(result.memory.id)
+                sim = self._cosine_similarity(memory.embedding, candidate.embedding)
+                if sim >= threshold:
+                    cluster.append(candidate)
+                    clustered.add(candidate.id)
 
             if len(cluster) >= min_size:
                 clusters.append(cluster)
@@ -170,7 +193,7 @@ class LifecycleManager:
             # Sort by importance (highest first), then by recency
             cluster.sort(key=lambda m: (-m.importance, -m.created_at))
 
-            # Build consolidated content: keep unique content
+            # Build consolidated content: keep unique content, join with newlines
             seen_content: set[str] = set()
             parts: list[str] = []
             for m in cluster:
@@ -179,7 +202,7 @@ class LifecycleManager:
                     seen_content.add(normalized)
                     parts.append(m.content)
 
-            merged_content = " | ".join(parts)
+            merged_content = "\n".join(parts)
             merged = self.merge_memories(
                 memory_ids=[m.id for m in cluster],
                 merged_content=merged_content,

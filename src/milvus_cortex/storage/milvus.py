@@ -26,6 +26,7 @@ from milvus_cortex.models import (
 logger = logging.getLogger(__name__)
 
 SCOPE_FIELDS = ("app_id", "user_id", "session_id", "agent_id", "workspace_id")
+ALLOWED_FILTER_KEYS = {*SCOPE_FIELDS, "memory_type", "importance", "source"}
 
 
 class MilvusStorage:
@@ -114,6 +115,26 @@ class MilvusStorage:
             return result.get("delete_count", len(memory_ids))
         return len(memory_ids)
 
+    def delete_expired(self, now: float, filters: dict | None = None) -> int:
+        """Delete expired memories using server-side scalar filtering."""
+        filter_parts = ["expires_at > 0", f"expires_at <= {now}"]
+        if filters:
+            extra = self._build_filter_expr(filters)
+            if extra:
+                filter_parts.append(extra)
+        filter_expr = " and ".join(filter_parts)
+
+        results = self._client.query(
+            collection_name=self._collection_name,
+            filter=filter_expr,
+            output_fields=["id"],
+            limit=10000,
+        )
+        if not results:
+            return 0
+        expired_ids = [r["id"] for r in results]
+        return self.delete(expired_ids)
+
     # ------------------------------------------------------------------
     # Search
     # ------------------------------------------------------------------
@@ -196,12 +217,10 @@ class MilvusStorage:
         self,
         content_embedding: list[float],
         context_embedding: list[float],
-        content_weight: float = 0.7,
-        context_weight: float = 0.3,
         filters: dict | None = None,
         top_k: int = 10,
     ) -> list[SearchResult]:
-        """Search across content and context vectors with weighted RRF fusion."""
+        """Search across content and context vectors with RRF fusion."""
         filter_expr = self._build_filter_expr(filters) if filters else ""
 
         content_req = AnnSearchRequest(
@@ -352,7 +371,7 @@ class MilvusStorage:
             "id": rel.id,
             "source_id": rel.source_id,
             "target_id": rel.target_id,
-            "_vec": [0.0, 0.0, 0.0, 0.0],
+            "embedding": rel.embedding or [0.0] * self._dim,
             "relation_type": rel.relation_type,
             "description": rel.description,
             "weight": rel.weight,
@@ -369,11 +388,12 @@ class MilvusStorage:
         entity_id: str,
         direction: str = "both",
     ) -> list[Relationship]:
+        escaped_id = entity_id.replace("\\", "\\\\").replace("'", "\\'")
         results: list[Relationship] = []
         if direction in ("outgoing", "both"):
             rows = self._client.query(
                 collection_name=self._rel_collection,
-                filter=f"source_id == '{entity_id}'",
+                filter=f"source_id == '{escaped_id}'",
                 output_fields=["*"],
                 limit=100,
             )
@@ -381,7 +401,7 @@ class MilvusStorage:
         if direction in ("incoming", "both"):
             rows = self._client.query(
                 collection_name=self._rel_collection,
-                filter=f"target_id == '{entity_id}'",
+                filter=f"target_id == '{escaped_id}'",
                 output_fields=["*"],
                 limit=100,
             )
@@ -393,6 +413,33 @@ class MilvusStorage:
                 seen.add(r.id)
                 unique.append(r)
         return unique
+
+    def search_relationships(
+        self,
+        embedding: list[float],
+        filters: dict | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[Relationship, float]]:
+        """Semantic search over relationships by embedding similarity."""
+        filter_expr = self._build_filter_expr(filters) if filters else None
+        results = self._client.search(
+            collection_name=self._rel_collection,
+            data=[embedding],
+            anns_field="embedding",
+            search_params={"metric_type": "COSINE"},
+            limit=top_k,
+            filter=filter_expr,
+            output_fields=["*"],
+        )
+        rels: list[tuple[Relationship, float]] = []
+        if results:
+            for hit in results[0]:
+                row = hit.get("entity", hit)
+                row["id"] = hit.get("id", row.get("id"))
+                parsed = self._rows_to_relationships([row])
+                if parsed:
+                    rels.append((parsed[0], hit.get("distance", 0.0)))
+        return rels
 
     def delete_relationship(self, rel_id: str) -> None:
         self._client.delete(collection_name=self._rel_collection, ids=[rel_id])
@@ -412,7 +459,8 @@ class MilvusStorage:
                 output_fields=["count(*)"],
             )
             return results[0].get("count(*)", 0) if results else 0
-        except Exception:
+        except Exception as e:
+            logger.debug("Failed to get row count for '%s': %s", name, e)
             return 0
 
     @property
@@ -452,14 +500,21 @@ class MilvusStorage:
                             self._collection_name,
                         )
                         self._use_server_bm25 = False
-                except Exception:
-                    # Can't detect schema — fall back safely
+                except Exception as e:
+                    logger.debug("Schema detection failed, falling back to client-side sparse: %s", e)
                     self._use_server_bm25 = False
             return
 
         schema = self._client.create_schema(auto_id=False, enable_dynamic_field=True)
         schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=64)
         schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._dim)
+
+        # Partition key for physical multi-tenancy (requires standalone/cloud Milvus)
+        if self._use_partition_key:
+            schema.add_field(
+                "user_id", DataType.VARCHAR, max_length=256,
+                is_partition_key=True,
+            )
 
         index_params = self._client.prepare_index_params()
         index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
@@ -534,9 +589,9 @@ class MilvusStorage:
         schema.add_field("id", DataType.VARCHAR, is_primary=True, max_length=64)
         schema.add_field("source_id", DataType.VARCHAR, max_length=64)
         schema.add_field("target_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("_vec", DataType.FLOAT_VECTOR, dim=4)
+        schema.add_field("embedding", DataType.FLOAT_VECTOR, dim=self._dim)
         index_params = self._client.prepare_index_params()
-        index_params.add_index(field_name="_vec", index_type="AUTOINDEX", metric_type="COSINE")
+        index_params.add_index(field_name="embedding", index_type="AUTOINDEX", metric_type="COSINE")
         self._client.create_collection(
             collection_name=self._rel_collection, schema=schema, index_params=index_params,
         )
@@ -641,11 +696,11 @@ class MilvusStorage:
             return ""
         parts: list[str] = []
         for key, value in filters.items():
-            if value is None:
+            if key not in ALLOWED_FILTER_KEYS or value is None:
                 continue
             if isinstance(value, str):
-                escaped = value.replace("'", "\\'")
+                escaped = value.replace("\\", "\\\\").replace("'", "\\'")
                 parts.append(f"{key} == '{escaped}'")
             elif isinstance(value, (int, float)):
-                parts.append(f"{key} == {value}")
+                parts.append(f"{key} == {float(value)}")
         return " and ".join(parts) if parts else ""

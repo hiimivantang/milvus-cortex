@@ -120,7 +120,9 @@ class GraphEngine:
         user_id: str | None = None,
         weight: float = 1.0,
     ) -> Relationship:
-        """Create a relationship between two entities."""
+        """Create a relationship between two entities with semantic embedding."""
+        embed_text = f"{relation_type}: {description}" if description else relation_type
+        embedding = self._embedder.embed_one(embed_text)
         rel = Relationship(
             source_id=source_id,
             target_id=target_id,
@@ -129,9 +131,27 @@ class GraphEngine:
             weight=weight,
             app_id=app_id,
             user_id=user_id,
+            embedding=embedding,
         )
         self._storage.insert_relationship(rel)
         return rel
+
+    def find_relationships(
+        self,
+        query: str,
+        *,
+        app_id: str | None = None,
+        user_id: str | None = None,
+        top_k: int = 10,
+    ) -> list[tuple[Relationship, float]]:
+        """Find relationships by semantic similarity to query."""
+        embedding = self._embedder.embed_one(query)
+        filters = {}
+        if app_id:
+            filters["app_id"] = app_id
+        if user_id:
+            filters["user_id"] = user_id
+        return self._storage.search_relationships(embedding, filters=filters, top_k=top_k)
 
     def get_relationships(
         self,

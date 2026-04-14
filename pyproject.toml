@@ -25,6 +25,13 @@ dev = [
 rerank = [
     "sentence-transformers>=2.0",
 ]
+tiktoken = [
+    "tiktoken>=0.5",
+]
+all = [
+    "sentence-transformers>=2.0",
+    "tiktoken>=0.5",
+]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/milvus_cortex"]

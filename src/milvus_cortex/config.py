@@ -18,10 +18,11 @@ class MilvusConfig(BaseModel):
 class EmbeddingConfig(BaseModel):
     """Settings for the embedding provider."""
 
-    provider: str = "openai"  # "openai" | "fake"
+    provider: str = "openai"  # "openai" | "http" | "fake"
     model: str = "text-embedding-3-small"
     dimensions: int = 1536
     api_key: str | None = None  # Falls back to OPENAI_API_KEY env var
+    base_url: str | None = None  # For "http" provider: e.g. "http://localhost:11434/v1"
     batch_size: int = 64
 
 
@@ -66,6 +67,7 @@ class LifecycleConfig(BaseModel):
     default_ttl_seconds: float | None = None  # None = no expiry
     working_memory_ttl_seconds: float = 3600.0  # 1 hour
     dedup_threshold: float = 0.95  # Cosine similarity threshold for dedup
+    dedup_content_threshold: float = 0.7  # Jaccard token-overlap threshold for content guard
     auto_dedup: bool = True
     auto_expire: bool = True
     consolidation_threshold: float = 0.85  # Similarity threshold for clustering

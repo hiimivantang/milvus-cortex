@@ -114,6 +114,8 @@ class Relationship(BaseModel):
     # Scope
     app_id: str | None = None
     user_id: str | None = None
+    # Vector for semantic graph traversal
+    embedding: list[float] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: float = Field(default_factory=time.time)
 

@@ -1,0 +1,41 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "memsearch-cortex"
+version = "0.3.0"
+description = "Memsearch fork powered by milvus-cortex memory runtime"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "milvus-cortex @ file:///${PROJECT_ROOT}/../../",
+    "click>=8.0",
+    "openai>=1.0",
+    "setuptools",
+    "tomli-w",
+    "watchdog>=3.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+google = ["google-genai>=1.0"]
+voyage = ["voyageai>=0.3"]
+ollama = ["ollama>=0.4"]
+local = ["sentence-transformers>=2.0"]
+onnx = ["onnxruntime>=1.16", "tokenizers>=0.15", "huggingface-hub>=0.20"]
+rerank = ["sentence-transformers>=2.0"]
+
+[project.scripts]
+memsearch = "memsearch.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["memsearch"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"

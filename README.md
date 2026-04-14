@@ -10,10 +10,12 @@ Generic memory frameworks (like mem0) support 25+ vector stores but treat each o
 |---------|-------------------|---------------|
 | Search | Dense vector only | **Hybrid dense+sparse (BM25 + RRF fusion)** |
 | Vectors | Single embedding | **Multi-vector (content + context)** |
-| Knowledge graph | Requires Neo4j | **Graph-on-Milvus (zero extra infra)** |
-| Memory management | Per-fact dedup | **Cluster-based consolidation pipeline** |
+| Knowledge graph | Requires Neo4j | **Graph-on-Milvus with semantic edge embeddings** |
+| Memory management | Per-fact dedup | **In-memory cluster consolidation + content-guarded dedup** |
 | Observability | None | **Native collection stats + search diagnostics** |
 | Multi-tenancy | Filter-based | **Partition key support (standalone/cloud)** |
+| Embeddings | OpenAI only | **OpenAI + any OpenAI-compatible endpoint (Ollama, HF TEI, vLLM)** |
+| Token estimation | N/A | **tiktoken (opt-in) or char-class heuristic** |
 
 ## Retrieval Quality (LongMemEval-S Benchmark)
 
@@ -101,7 +103,7 @@ results = runtime.search(
 
 ### 3. Graph-on-Milvus (No Neo4j)
 
-Entity and relationship memory stored directly in Milvus — zero additional infrastructure. Entity resolution via vector similarity, graph traversal via filtered search.
+Entity and relationship memory stored directly in Milvus — zero additional infrastructure. Entity resolution via vector similarity, relationship embeddings enable semantic graph traversal, and filtered queries handle structural traversal.
 
 ```python
 config = CortexConfig(graph=GraphConfig(enabled=True))
@@ -109,7 +111,8 @@ runtime = MemoryRuntime.from_config(config)
 
 alice = runtime.add_entity(name="Alice", entity_type="person", app_id="g")
 python = runtime.add_entity(name="Python", entity_type="tool", app_id="g")
-runtime.add_relationship(alice.id, python.id, "uses", app_id="g")
+runtime.add_relationship(alice.id, python.id, "uses",
+                         description="Alice uses Python daily", app_id="g")
 
 # Search entities and traverse relationships
 result = runtime.graph_search(query="engineer", app_id="g", depth=2)
@@ -118,7 +121,7 @@ result = runtime.graph_search(query="engineer", app_id="g", depth=2)
 
 ### 4. Memory Consolidation Pipeline
 
-Cluster related memories by vector proximity and merge them. Reduces redundancy without losing information.
+Cluster related memories by in-memory pairwise cosine similarity and merge them. Avoids O(n) Milvus search calls — clustering is done entirely in-memory from fetched embeddings. Dedup uses content-guarded matching to prevent false merges of semantically similar but distinct content.
 
 ```python
 consolidated = runtime.consolidate(
@@ -148,11 +151,37 @@ print(f"P95 latency: {diag.get('p95_ms', 'N/A')}ms")
 
 ### 6. Partition Key Multi-Tenancy
 
-Physical data isolation per user via Milvus partition keys. Zero filter overhead at query time. (Requires standalone/cloud Milvus — Milvus Lite falls back to filter-based scoping.)
+Physical data isolation per user via Milvus partition keys. When `use_partition_key=True`, the `user_id` field is declared as a partition key in the collection schema, giving physical tenant isolation with zero filter overhead at query time. (Requires standalone/cloud Milvus — Milvus Lite falls back to filter-based scoping.)
 
 ```python
 config = CortexConfig(
     milvus=MilvusConfig(uri="http://localhost:19530", use_partition_key=True),
+)
+```
+
+### 7. Pluggable Embedding Providers
+
+Supports OpenAI, or any OpenAI-compatible HTTP endpoint (Ollama, HuggingFace TEI, vLLM, LiteLLM). No additional dependencies needed — the HTTP provider uses the `openai` library with a custom `base_url`.
+
+```python
+# Ollama (local)
+config = CortexConfig(
+    embedding=EmbeddingConfig(
+        provider="http",
+        base_url="http://localhost:11434/v1",
+        model="nomic-embed-text",
+        dimensions=768,
+    ),
+)
+
+# HuggingFace TEI
+config = CortexConfig(
+    embedding=EmbeddingConfig(
+        provider="http",
+        base_url="http://localhost:8080/v1",
+        model="BAAI/bge-base-en-v1.5",
+        dimensions=768,
+    ),
 )
 ```
 
@@ -188,6 +217,7 @@ src/milvus_cortex/
 ├── embedding/
 │   ├── base.py             # EmbeddingProvider ABC
 │   ├── openai.py           # OpenAI embeddings
+│   ├── http.py             # Any OpenAI-compatible endpoint (Ollama, HF TEI, vLLM)
 │   ├── fake.py             # Deterministic fake for testing
 │   └── sparse.py           # BM25-style sparse vectorizer (no deps)
 ├── extraction/
@@ -212,9 +242,10 @@ CortexConfig(
         use_partition_key=False,       # Physical tenant isolation
     ),
     embedding=EmbeddingConfig(
-        provider="openai",
+        provider="openai",             # "openai" | "http" | "fake"
         model="text-embedding-3-small",
         dimensions=1536,
+        base_url=None,                 # For "http": e.g. "http://localhost:11434/v1"
     ),
     hybrid_search=HybridSearchConfig(
         enabled=True,                  # Dense + sparse search

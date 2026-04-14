@@ -43,9 +43,18 @@ class RetrievalOrchestrator:
         mode: str = "auto",
         context_query: str | None = None,
         rerank: bool = False,
+        query_embedding: list[float] | None = None,
     ) -> list[SearchResult]:
-        """Vector search with optional hybrid/multi-vector modes."""
-        query_embedding = self._embedder.embed_one(query)
+        """Vector search with optional hybrid/multi-vector modes.
+
+        Parameters
+        ----------
+        query_embedding:
+            Pre-computed query embedding. When provided, skips the internal
+            embed call. Useful for adapters that generate their own embeddings.
+        """
+        if query_embedding is None:
+            query_embedding = self._embedder.embed_one(query)
 
         combined_filters = dict(filters) if filters else {}
         if memory_types and len(memory_types) == 1:
@@ -122,10 +131,23 @@ class RetrievalOrchestrator:
             rerank=rerank,
         )
 
-        total_chars = sum(len(r.memory.content) for r in results)
-        token_estimate = total_chars // 4
+        total_text = "".join(r.memory.content for r in results)
+        token_estimate = _estimate_tokens(total_text)
 
         return ContextBundle(
             memories=results,
             token_estimate=token_estimate,
         )
+
+
+def _estimate_tokens(text: str) -> int:
+    """Estimate token count. Uses tiktoken if available, else a char-class heuristic."""
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except ImportError:
+        # Heuristic: ASCII ~4 chars/token, non-ASCII (CJK etc) ~1.5 chars/token
+        ascii_chars = sum(1 for c in text if ord(c) < 128)
+        non_ascii_chars = len(text) - ascii_chars
+        return max(1, int(ascii_chars / 4 + non_ascii_chars / 1.5))

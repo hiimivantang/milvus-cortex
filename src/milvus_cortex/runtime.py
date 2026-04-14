@@ -37,6 +37,9 @@ from milvus_cortex.storage.milvus import MilvusStorage
 def _build_embedder(config: CortexConfig) -> EmbeddingProvider:
     if config.embedding.provider == "fake":
         return FakeEmbedding(config.embedding)
+    if config.embedding.provider == "http":
+        from milvus_cortex.embedding.http import HttpEmbedding
+        return HttpEmbedding(config.embedding)
     return OpenAIEmbedding(config.embedding)
 
 
@@ -141,23 +144,38 @@ class MemoryRuntime:
         metadata: dict[str, Any] | None = None,
         expires_at: float | None = None,
         context: str | None = None,
+        embedding: list[float] | None = None,
+        memory_id: str | None = None,
+        source: str | None = None,
     ) -> Memory:
         """Store a single memory with automatic embedding, dedup, and TTL.
 
         Sparse embeddings for hybrid search are handled by the storage layer —
         never computed here.
+
+        Parameters
+        ----------
+        embedding:
+            Pre-computed embedding vector. When provided, skips the internal
+            embed call. Useful for adapters that generate their own embeddings.
+        memory_id:
+            Custom memory ID. When provided, uses this instead of generating
+            a UUID. Useful for adapters with their own ID scheme (e.g. chunk hashes).
+        source:
+            Source identifier (e.g. file path). Overrides the default "manual".
         """
         if isinstance(memory_type, str):
             memory_type = MemoryType(memory_type)
 
-        embedding = self._embedder.embed_one(content)
+        if embedding is None:
+            embedding = self._embedder.embed_one(content)
 
         # Multi-vector: context embedding
         context_embedding = None
         if self._config.multi_vector.enabled and context:
             context_embedding = self._embedder.embed_one(context)
 
-        memory = Memory(
+        memory_kwargs: dict[str, Any] = dict(
             content=content,
             memory_type=memory_type,
             app_id=app_id,
@@ -170,9 +188,12 @@ class MemoryRuntime:
             # sparse_embedding is NOT set here — storage layer handles it
             importance=importance,
             metadata=metadata or {},
-            source="manual",
+            source=source or "manual",
             expires_at=expires_at,
         )
+        if memory_id is not None:
+            memory_kwargs["id"] = memory_id
+        memory = Memory(**memory_kwargs)
         memory = self._lifecycle.apply_ttl(memory)
 
         # Dedup check
@@ -274,8 +295,16 @@ class MemoryRuntime:
         mode: str = "auto",
         context_query: str | None = None,
         rerank: bool = False,
+        query_embedding: list[float] | None = None,
     ) -> list[SearchResult]:
-        """Search for relevant memories with optional hybrid, multi-vector, or rerank mode."""
+        """Search for relevant memories with optional hybrid, multi-vector, or rerank mode.
+
+        Parameters
+        ----------
+        query_embedding:
+            Pre-computed query embedding. When provided, skips the internal
+            embed call. Useful for adapters that generate their own embeddings.
+        """
         filters = self._scope_filters(
             app_id=app_id, user_id=user_id, session_id=session_id,
             agent_id=agent_id, workspace_id=workspace_id,
@@ -290,6 +319,7 @@ class MemoryRuntime:
             memory_types=types, min_score=min_score,
             mode=mode, context_query=context_query,
             rerank=rerank,
+            query_embedding=query_embedding,
         )
         latency_ms = (time.time() - t0) * 1000
         self._observability.record_search_latency(latency_ms)
@@ -436,6 +466,11 @@ class MemoryRuntime:
             raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
         return self._graph.get_relationships(entity_id, direction=direction)
 
+    @property
+    def graph_enabled(self) -> bool:
+        """Whether the graph engine is available."""
+        return self._graph is not None
+
     def graph_search(
         self,
         query: str,
@@ -450,6 +485,20 @@ class MemoryRuntime:
         return self._graph.graph_search(
             query=query, app_id=app_id, user_id=user_id,
             top_k=top_k, depth=depth,
+        )
+
+    def extract_from_text(
+        self,
+        text: str,
+        *,
+        app_id: str | None = None,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Extract entities and relationships from text using the graph engine."""
+        if not self._graph:
+            raise RuntimeError("Graph is not enabled. Set config.graph.enabled = True")
+        return self._graph.extract_from_text(
+            text, app_id=app_id, user_id=user_id,
         )
 
     # ------------------------------------------------------------------
